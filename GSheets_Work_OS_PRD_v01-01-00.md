@@ -187,7 +187,7 @@ Priorities: P0 \= blocking for MVP · P1 \= required for v1.0 · P2 \= next rele
 | ----- | ----- | :---: | ----- |
 | **M1-01** | Fixed column schema: ID, Title, Project, Epic, Parent Task, Status, Assignee, Priority, Start Date, Due Date, Scheduled Date, Effort (h), Tags, Notion Link. Separate "Projects" and "Epics" tabs with their own schemas (§9.1, §9.2). | **P0** | All columns in the "Board" tab; data validation (dropdown) for Status, Priority, Project, and Epic. Projects and Epics tabs created with computed columns. |
 | **M1-02** | Quick capture line at the top of the board with natural language parsing to automatically fill in fields. | **P0** | Typing "review PR tomorrow P1" creates a task with the correct title, due date, and priority via Apps Script. |
-| **M1-03** | Global shortcut (Chrome extension / AutoHotKey / Raycast) that opens the task creation modal directly from any screen. | **P1** | Modal opens in \< 500 ms; task created in \< 2 s after submit. |
+| **M1-03** | Global shortcut via **Quick Capture** — a Tauri v2 desktop mini-app (~15 MB, system tray) activated by `Cmd/Ctrl+Shift+T` from any screen. Two-tiered NLP: **Tier 1** (local, deterministic regex parser in TypeScript, ~0 ms) extracts priority, date, tags, project, assignee, and effort from structured input; **Tier 2** (agent-assisted, `board_parse_and_create_task` MCP tool calling Gemini, ~2–5 s) handles ambiguous natural language when Tier 1 confidence < 0.6. See `quick-capture/` directory for implementation. | **P1** | Shortcut opens floating window in < 500 ms; Tier 1 task creation completes in < 2 s; Tier 2 completes in < 5 s; window hides automatically after confirmation. |
 | **M1-04** | Filters and sorting by any column without altering the data structure. | **P0** | Using native Sheets filters does not impact Apps Script sync. |
 | **M1-05** | Kanban view via HtmlService sidebar grouped by Status with draggable cards. | **P1** | Drag end call google.script.run.updateTaskStatus(rowId, newStatus); updates in \< 2 s |
 | **M1-06** | View Timeline/Gantt via HtmlService showing Start Date → Due Date by project | **P1** | Toolbars rendered by project; click opens task details; read-only in v1.0 |
@@ -301,6 +301,7 @@ All tools follow the standard MCP schema: name, description, inputSchema (JSON S
 | **board\_complete\_task** | Mark task as Done and sync with Google Tasks. | { task\_id } | { success, completed\_at } |
 | **board\_get\_subtasks** | Get all sub-tasks for a given parent task. | { parent\_task\_id: string } | { subtasks: Task\[\], count: number } |
 | **board\_bulk\_reschedule** | Reschedule multiple tasks at once. | { task\_ids: string\[\], new\_scheduled\_date: date } | { updated\_count, errors: \[\] } |
+| **board\_parse\_and\_create\_task** | Tier 2 NLP endpoint for Quick Capture. Receives raw natural-language text, calls an LLM (Gemini via UrlFetchApp) to parse it into structured fields, then creates the task. Used when the local Tier 1 parser's confidence is below threshold. | { raw\_text: string, source?: string } | { task\_id, title, parsed\_fields: Partial\<Task\>, confidence: number } |
 
 ### **7.2.2 External MCP — Notion** {#7.2.2-external-mcp-notion}
 
