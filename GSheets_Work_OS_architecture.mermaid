@@ -1,0 +1,72 @@
+%%{init: {'theme': 'dark', 'flowchart': {'curve': 'basis'}}}%%
+flowchart TB
+
+    classDef ui     fill:#0d1f3c,stroke:#3b82f6,color:#bfdbfe
+    classDef hub    fill:#071a0e,stroke:#22c55e,color:#86efac
+    classDef store  fill:#111827,stroke:#4b5563,color:#9ca3af
+    classDef tasks  fill:#0d0b2e,stroke:#7c3aed,color:#c4b5fd
+    classDef notion fill:#1c0d00,stroke:#c2410c,color:#fed7aa
+    classDef notif  fill:#1a0d00,stroke:#d97706,color:#fde68a
+
+    subgraph ENTRY["📥  User Interfaces — Entry Points"]
+        direction LR
+        SH["📊 Google Sheets\n─────────────\nMonday-like board\nStatus · Owner · Priority\nDates · Custom columns\n─────────────\nentry ①"]
+        MB["📱 Google Tasks App\n─────────────\nMobile multi-device sync\nComplete tasks on-the-go\nPush notifications\n─────────────\nentry ②"]
+        NT["📖 Notion\n─────────────\nDocs · Assets · Databases\nComments (threaded)\nCitations & @mentions\n─────────────\nentry ③"]
+    end
+
+    subgraph HUB["⚙️  Apps Script — Orchestration Hub"]
+        direction LR
+        TR["🔔 Triggers\n──────\nonEdit · onOpen\nTime-based clock\nForms · Webhooks\n──────\nroutes all events"]
+        SE["🔄 Sync Engine\n──────\nBidirectional mapper\nSheets ↔ Google Tasks\nID registry (Props)\nDelta sync\n──────\nsource of truth"]
+        NP["🔍 Notion Poller\n──────\nGET /comments\nGET /search (citations)\nCursor-based paging\nTask stub builder\n──────\n'Review X on page Y'"]
+        WE["⚡ Workflow Engine\n──────\nStatus if/then rules\nAssignment alerts\nOverdue escalation\nApproval flows\n──────\nfires on changes"]
+        HS["🪟 HtmlService\n──────\nRich sidebar panels\nTask detail modals\nKanban overlay\nCharts & reports\n──────\nrenders in Sheets"]
+        PROPS[("📦 PropertiesService\n──────\nSheet↔Task ID map\nNotion cursor state\nLast sync timestamp\nConfig & API secrets")]
+    end
+
+    subgraph STORES["🗄️  Data Stores"]
+        direction LR
+        GT["✅  Google Tasks + Calendar\n─────────────\nTask Lists — one per project\nCompletion status\nDue dates → Calendar events\nMobile push reminders\n─────────────\nTasks API v1  ·  Calendar API v3"]
+        ND["📚  Notion Data Layer\n─────────────\nPages & Databases\nSpecs · Designs · Docs\nComments (threaded & resolved)\nCitations & @mentions\nAsset URLs → cell embeds\n─────────────\nNotion API  ·  polling only"]
+    end
+
+    subgraph OUT["📣  Notifications & Outputs"]
+        direction LR
+        MAIL["📧  Gmail / MailApp\n─────\nTask assigned\nOverdue alerts\nApproval requests\n─────\nMailApp.sendEmail()"]
+        CHAT["💬  Google Chat\n─────\nStatus change digests\nEscalations & mentions\nDaily summary cards\n─────\nIncoming Webhook"]
+    end
+
+    %% ── Inbound user actions ──────────────────────────────────
+    SH   -->|"① onEdit row or new task"| TR
+    SH   -.->|"open modal / sidebar"| HS
+    MB   -->|"② ✓ task completed\ndirect Tasks API call"| GT
+    NT   -->|"③ comment posted\nor citation added"| ND
+
+    %% ── Hub internal flows ────────────────────────────────────
+    TR   -->|"dispatch"| SE
+    TR   -.->|"time-based\nscheduled poll"| NP
+    NP   -->|"task stub:\n'Review [comment]\n on page [Y]'"| SE
+    SE   -->|"state change\ntriggers rules"| WE
+    SE   -->|"write ID map\n& timestamp"| PROPS
+    PROPS -->|"read cursor\n& config"| NP
+
+    %% ── Sync: Apps Script ↔ Google Tasks ─────────────────────
+    SE   -->|"create / update task"| GT
+    GT   -.->|"time poll → ✓\nreflect in Sheets row"| SE
+
+    %% ── Notion integration ────────────────────────────────────
+    ND   -->|"GET polls:\ncomments & citations"| NP
+    ND   -.->|"asset URL →\ncell hyperlink"| SH
+
+    %% ── Outbound alerts ───────────────────────────────────────
+    WE   -->|"trigger alert"| MAIL
+    WE   -->|"trigger alert"| CHAT
+    HS   -.->|"rendered inside\nSheets sidebar frame"| SH
+
+    class SH,MB,NT ui
+    class TR,SE,NP,WE,HS hub
+    class PROPS store
+    class GT tasks
+    class ND notion
+    class MAIL,CHAT notif
