@@ -292,8 +292,11 @@ All tools follow the standard MCP schema: name, description, inputSchema (JSON S
 | **board\_create\_epic** | Create a new epic under a project. | { title, project\_id, description?, responsible?, target\_date?, priority? } | { epic\_id } |
 | **board\_update\_epic** | Update fields in an existing epic. | { epic\_id, fields: Partial\<Epic\> } | { success, updated\_fields: string\[\] } |
 | **board\_get\_my\_tasks** | Tasks assigned to a user with optional filters. | { assignee, status\_filter?, due\_filter?: "today"\|"week"\|"overdue", include\_subtasks?: boolean } | { tasks: Task\[\] } |
+| **board\_get\_task** | Returns a single task by ID with full details including sub-tasks. | { task\_id: string, include\_subtasks?: boolean } | { task: Task, subtasks?: Task\[\] } |
+| **board\_search\_tasks** | Free-text search across task titles, tags, and descriptions. Enables IDE/coworker agents to find tasks by context (e.g., "sync engine") without needing to know IDs. | { query: string, project\_id?: string, status\_filter?: string, limit?: number } | { tasks: Task\[\], count: number } |
 | **board\_get\_overdue** | Tasks with a due date in the past and a status of \!= Done | { assignee\_filter?: string } | { tasks: Task\[\], count: number } |
 | **board\_create\_task** | Create a new task on the board and sync it with Google Tasks. | { title, project\_id, epic\_id?, parent\_task\_id?, assignee?, due\_date?, priority?, scheduled\_date?, notion\_link? } | { task\_id, row\_id, gtask\_id } |
+| **board\_create\_follow\_up** | Creates one or more successor tasks linked to a completed or in-progress task. Used by IDE agents to spawn review, testing, or deployment tasks after finishing implementation. | { source\_task\_id: string, follow\_ups: \[{ title, assignee?, priority?, due\_date?, relationship: "review"\|"test"\|"deploy"\|"alternative"\|"continuation" }\] } | { created: \[{ task\_id, title, relationship }\] } |
 | **board\_update\_task** | Updates fields in an existing task. | { task\_id, fields: Partial\<Task\> } | { success, updated\_fields: string\[\] } |
 | **board\_complete\_task** | Mark task as Done and sync with Google Tasks. | { task\_id } | { success, completed\_at } |
 | **board\_get\_subtasks** | Get all sub-tasks for a given parent task. | { parent\_task\_id: string } | { subtasks: Task\[\], count: number } |
@@ -468,6 +471,78 @@ FORMATO DO STANDUP (notify\_post\_standup):
 
 Narrative: brief, in Brazilian Portuguese, direct. Maximum 2 sentences.
 
+## **7.6 Multi-Agent Access Model** {#7.6-multi-agent-access-model}
+
+The Board MCP is designed to be consumed not only by the Daily Agent but by any MCP-compatible agent — IDE coding agents (Claude Code, Cursor, Windsurf), coworker agents, CI/CD bots, or custom automation scripts. To support this safely, the system implements agent identity and role-based permissions at the MCP layer.
+
+### **7.6.1 Agent Authentication** {#7.6.1-agent-authentication}
+
+Each agent receives a unique `agent_id` and its own HMAC secret, both stored in PropertiesService:
+
+| Property Key | Example | Notes |
+| ----- | ----- | ----- |
+| `agent_secret_daily` | `hmac-sha256-secret-daily-...` | Daily Agent (morning + EOD rituals) |
+| `agent_secret_ide_alice` | `hmac-sha256-secret-ide-alice-...` | Alice's IDE agent (Claude Code / Cursor) |
+| `agent_secret_ci` | `hmac-sha256-secret-ci-...` | CI/CD pipeline bot |
+
+Every MCP request must include `agent_id` in the JSON-RPC params. The endpoint validates the HMAC using the agent-specific secret. This allows:
+- **Per-agent audit trail** — every change recorded in Changelog includes the agent\_id.
+- **Per-agent revocation** — disable one agent without affecting others.
+- **Per-agent rate limiting** — prevent a runaway agent from exhausting the Apps Script quota.
+
+### **7.6.2 Agent Roles and Permission Scopes** {#7.6.2-agent-roles}
+
+Permissions are enforced server-side by the Apps Script Tool Router, not by prompt instructions alone. Each role defines which MCP tools are allowed:
+
+| Role | Intended Consumer | Allowed Tools | Denied Tools |
+| ----- | ----- | ----- | ----- |
+| **daily** | Daily Agent (scheduled morning + EOD) | `board_get_my_tasks`, `board_get_overdue`, `board_get_task`, `board_search_tasks`, `board_complete_task`, `board_update_task` (status, scheduled\_date, priority only), `board_bulk_reschedule`, `board_get_subtasks`, `board_get_project`, `board_list_projects`, `board_list_epics`, `board_get_epic`, `notify_post_standup` | `board_create_project`, `board_update_project`, `board_create_epic`, `board_update_epic`, `board_create_task` (requires `ide` or `admin`), `board_create_follow_up` |
+| **ide** | IDE coding agents (Claude Code, Cursor, Windsurf, etc.) | `board_get_task`, `board_search_tasks`, `board_get_my_tasks`, `board_get_project`, `board_get_epic`, `board_get_subtasks`, `board_complete_task`, `board_update_task`, `board_create_task`, `board_create_follow_up` | `board_create_project`, `board_create_epic`, `board_update_project`, `board_update_epic`, `board_bulk_reschedule`, `notify_post_standup` |
+| **admin** | Human user (via direct MCP client or global shortcut) | All tools | None |
+
+> **Role assignment:** the `agent_id → role` mapping is stored in PropertiesService as `agent_role_{agent_id}`. Default role for unrecognized agent\_ids: **denied** (fail-closed).
+
+### **7.6.3 IDE / Coworker Agent Workflow Example** {#7.6.3-ide-agent-workflow}
+
+A typical flow for a Claude Code agent working on a coding task:
+
+```
+1. Agent starts a coding session and queries the board:
+   → board_search_tasks(query="sync engine", status_filter="In Progress")
+   ← { tasks: [{ task_id: "TSK-0042", title: "Implement sync engine", ... }] }
+
+2. Agent works on the implementation, then marks the task done:
+   → board_complete_task(task_id="TSK-0042")
+   ← { success: true, completed_at: "2025-04-10T16:30:00" }
+
+3. Agent creates follow-up tasks for review and testing:
+   → board_create_follow_up(
+       source_task_id="TSK-0042",
+       follow_ups=[
+         { title: "Code review: sync engine", relationship: "review", assignee: "alice@co.com", priority: "P1" },
+         { title: "Write integration tests: sync engine", relationship: "test", priority: "P2" },
+         { title: "Evaluate alternative: Cloud Functions vs Apps Script triggers", relationship: "alternative", priority: "P2" }
+       ]
+     )
+   ← { created: [
+       { task_id: "TSK-0043", title: "Code review: sync engine", relationship: "review" },
+       { task_id: "TSK-0044", title: "Write integration tests: sync engine", relationship: "test" },
+       { task_id: "TSK-0045", title: "Evaluate alternative: ...", relationship: "alternative" }
+     ] }
+```
+
+All three actions are logged in the Changelog with the IDE agent's `agent_id`, making it clear that the completion and follow-ups were agent-driven, not human-driven.
+
+### **7.6.4 Changelog Agent Audit Fields** {#7.6.4-changelog-agent-audit}
+
+The Changelog tab (M1-09) is extended with agent-specific columns:
+
+| Field | Type | Example | Notes |
+| ----- | ----- | ----- | ----- |
+| **source** | enum | agent | `human` (Sheets UI edit) \| `agent` (MCP call) \| `system` (Apps Script trigger) |
+| **agent\_id** | string | ide\_alice | Null when source = human. Identifies which agent made the change. |
+| **agent\_role** | string | ide | The role under which the agent was operating. |
+
 # **8\. Non-Functional Requirements** {#8.-non-functional-requirements}
 
 ---
@@ -576,7 +651,10 @@ All tasks — including sub-tasks — reside in the same "Board" tab. A task bec
 | **effort\_h** | number | 2.5 | Estimate in hours; used in velocity tracking. |
 | **tags** | string\[\] | bigquery,review | CSV; no spaces; lowercase. |
 | **notion\_link** | url | notion.so/page/... | Populated by Notion Poller; hyperlink in Sheets cell. |
+| **follow\_up\_from** | string | TSK-0040 | FK to the predecessor task that originated this follow-up; null if not a follow-up. Set by `board_create_follow_up`. |
+| **follow\_up\_type** | enum | review | review \| test \| deploy \| alternative \| continuation; null if not a follow-up. Describes the relationship to the predecessor. |
 | **gtask\_id** | string | MDEwOTEx... | ID da Google Task; hidden column in Sheets. |
+| **created\_by** | string | ide\_alice | `agent_id` of the agent that created this task, or "human" if created via Sheets UI. Used for audit. |
 | **created\_at** | datetime | 2025-04-07T08:30:00 | Auto-populated in the onEdit creation event; immutable. |
 
 **Sub-task behavior rules:**
