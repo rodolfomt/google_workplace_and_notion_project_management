@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quick Capture</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="input-row">
+        <input
+          id="task-input"
+          type="text"
+          placeholder="review PR tomorrow P1 #backend @myproject"
+          autofocus
+          spellcheck="false"
+        />
+        <div id="tier-badge" title="Tier 1: local parse">T1</div>
+      </div>
+
+      <div id="preview" class="hidden">
+        <div id="preview-fields"></div>
+      </div>
+
+      <div id="status-bar" class="hidden">
+        <span id="status-text"></span>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,144 @@
+/* ── Quick Capture — Spotlight-style floating window ─────────────── */
+
+:root {
+  --bg: #1e1e2e;
+  --bg-preview: #181825;
+  --fg: #cdd6f4;
+  --fg-dim: #6c7086;
+  --accent: #89b4fa;
+  --accent-green: #a6e3a1;
+  --accent-yellow: #f9e2af;
+  --accent-red: #f38ba8;
+  --accent-orange: #fab387;
+  --border: #313244;
+  --radius: 12px;
+  font-family: "SF Pro Text", "Inter", -apple-system, sans-serif;
+  font-size: 14px;
+  color: var(--fg);
+  background: transparent;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: transparent;
+  overflow: hidden;
+}
+
+#app {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+/* ── Input row ──────────────────────────────────────────────────── */
+
+#input-row {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  gap: 10px;
+}
+
+#task-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--fg);
+  font-size: 16px;
+  font-family: inherit;
+  caret-color: var(--accent);
+}
+
+#task-input::placeholder {
+  color: var(--fg-dim);
+}
+
+#tier-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--bg);
+  white-space: nowrap;
+  transition: background 0.2s;
+}
+
+#tier-badge.tier2 {
+  background: var(--accent-yellow);
+}
+
+/* ── Parsed preview ─────────────────────────────────────────────── */
+
+#preview {
+  border-top: 1px solid var(--border);
+  background: var(--bg-preview);
+  padding: 10px 16px;
+  transition: opacity 0.15s;
+}
+
+#preview.hidden {
+  display: none;
+}
+
+#preview-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.field-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  background: var(--border);
+  color: var(--fg);
+}
+
+.field-pill .label {
+  color: var(--fg-dim);
+  font-weight: 500;
+}
+
+.field-pill.priority-P0 { background: #45232e; color: var(--accent-red); }
+.field-pill.priority-P1 { background: #3d2e1a; color: var(--accent-orange); }
+.field-pill.priority-P2 { background: #1e2a3d; color: var(--accent); }
+.field-pill.priority-P3 { background: #1e2e1e; color: var(--accent-green); }
+.field-pill.tag { background: #232340; color: var(--accent); }
+
+/* ── Status bar ─────────────────────────────────────────────────── */
+
+#status-bar {
+  border-top: 1px solid var(--border);
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  text-align: center;
+}
+
+#status-bar.hidden { display: none; }
+#status-bar.success { color: var(--accent-green); }
+#status-bar.error { color: var(--accent-red); }
+#status-bar.pending { color: var(--accent-yellow); }
+
+/* ── Keyboard hint ──────────────────────────────────────────────── */
+
+.kbd {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--border);
+  color: var(--fg-dim);
+  margin-left: 4px;
+}

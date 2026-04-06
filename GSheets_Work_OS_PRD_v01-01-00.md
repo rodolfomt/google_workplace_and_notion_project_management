@@ -185,9 +185,9 @@ Priorities: P0 \= blocking for MVP · P1 \= required for v1.0 · P2 \= next rele
 
 | ID | Description | At | Acceptance Criteria |
 | ----- | ----- | :---: | ----- |
-| **M1-01** | Fixed column schema: ID, Title, Project, Status, Assignee, Priority, Start Date, Due Date, Scheduled Date, Effort (h), Tags, Notion Link | **P0** | All columns in the "Board" tab; data validation (dropdown) for Status and Priority. |
+| **M1-01** | Fixed column schema: ID, Title, Project, Epic, Parent Task, Status, Assignee, Priority, Start Date, Due Date, Scheduled Date, Effort (h), Tags, Notion Link. Separate "Projects" and "Epics" tabs with their own schemas (§9.1, §9.2). | **P0** | All columns in the "Board" tab; data validation (dropdown) for Status, Priority, Project, and Epic. Projects and Epics tabs created with computed columns. |
 | **M1-02** | Quick capture line at the top of the board with natural language parsing to automatically fill in fields. | **P0** | Typing "review PR tomorrow P1" creates a task with the correct title, due date, and priority via Apps Script. |
-| **M1-03** | Global shortcut (Chrome extension / AutoHotKey / Raycast) that opens the task creation modal directly from any screen. | **P1** | Modal opens in \< 500 ms; task created in \< 2 s after submit. |
+| **M1-03** | Global shortcut via **Quick Capture** — a Tauri v2 desktop mini-app (~15 MB, system tray) activated by `Cmd/Ctrl+Shift+T` from any screen. Two-tiered NLP: **Tier 1** (local, deterministic regex parser in TypeScript, ~0 ms) extracts priority, date, tags, project, assignee, and effort from structured input; **Tier 2** (agent-assisted, `board_parse_and_create_task` MCP tool calling Gemini, ~2–5 s) handles ambiguous natural language when Tier 1 confidence < 0.6. See `quick-capture/` directory for implementation. | **P1** | Shortcut opens floating window in < 500 ms; Tier 1 task creation completes in < 2 s; Tier 2 completes in < 5 s; window hides automatically after confirmation. |
 | **M1-04** | Filters and sorting by any column without altering the data structure. | **P0** | Using native Sheets filters does not impact Apps Script sync. |
 | **M1-05** | Kanban view via HtmlService sidebar grouped by Status with draggable cards. | **P1** | Drag end call google.script.run.updateTaskStatus(rowId, newStatus); updates in \< 2 s |
 | **M1-06** | View Timeline/Gantt via HtmlService showing Start Date → Due Date by project | **P1** | Toolbars rendered by project; click opens task details; read-only in v1.0 |
@@ -256,17 +256,24 @@ Priorities: P0 \= blocking for MVP · P1 \= required for v1.0 · P2 \= next rele
 
 The MCP (Model Context Protocol) layer exposes GSheets Work OS as a set of tools consumable by AI agents. This allows an agent (Claude, GPT-4o, or another) to execute automated planning rituals—the "dailies"—and query or update the board conversationally without the user needing to open Sheets.
 
+**Design principle:** do not reinvent the wheel. Mature MCP servers already exist for Notion, Google Calendar, Google Tasks, and Gmail. The custom Apps Script MCP is scoped exclusively to board business logic (projects, epics, tasks, sub-tasks) — the data layer that only this system understands. Everything else is delegated to external MCPs.
+
 ## **7.1 MCP Server Architecture** {#7.1-mcp-server-architecture}
 
-The MCP Server is implemented as an Apps Script (doPost) endpoint that interprets JSON-RPC 2.0 calls in MCP format. Apps Script acts as a proxy for all ecosystem APIs (Sheets, Google Tasks, Calendar, Notion), eliminating the need for external infrastructure.
+The agent connects to **two tiers** of MCP servers simultaneously:
 
-| Component | Technology | Paper |
+**Tier 1 — Custom Board MCP (built in this project):** An Apps Script `doPost(e)` endpoint implementing JSON-RPC 2.0. Responsible exclusively for board operations: reading/writing projects, epics, tasks, and sub-tasks in the Sheets data model. This is the only tier that requires custom development.
+
+**Tier 2 — External MCPs (reused, not built):** Established MCP servers for Notion, Google Calendar, Google Tasks, and Gmail. The agent calls these directly; no proxy or wrapper is needed.
+
+| Component | Technology | Role |
 | ----- | ----- | ----- |
-| **MCP Endpoint** | Apps Script doPost(e) | Receives JSON-RPC 2.0 calls from the agent; validates HMAC-SHA256; routes to the correct handler. |
-| **Tool Router** | Function dispatch table | Maps tool\_name to Apps Script function; executes with correct user context; returns structured JSON. |
-| **Auth** | HMAC-SHA256 shared secret | Secret stored in PropertiesService; validated on each call; monthly rotation via automated script. |
-| **External MCPs** | Notion MCP · Gmail MCP · GCal MCP | The agent connects these MCPs directly for additional context; the GSheets MCP focuses on the board data. |
-| **Transport** | HTTPS (Apps Script URL) | Public endpoint protected by HMAC; rate limit: 60 calls/min via LockService; logs in PropertiesService. |
+| **Board MCP Endpoint** | Apps Script doPost(e) | Receives JSON-RPC 2.0 calls; validates HMAC-SHA256; routes to board handlers. Scope: projects, epics, tasks only. |
+| **Tool Router** | Function dispatch table | Maps tool\_name → Apps Script function; returns structured JSON. |
+| **Auth** | HMAC-SHA256 shared secret | Secret stored in PropertiesService; validated on each call; monthly rotation. |
+| **Transport** | HTTPS (Apps Script URL) | Public endpoint protected by HMAC; rate limit: 60 calls/min via LockService. |
+| **Notion MCP** | `@notionhq/notion-mcp-server` (remote) | Official Notion-maintained MCP. Used directly by the agent for page reads, comment retrieval, and search. Not proxied through Apps Script. |
+| **Google Workspace MCP** | `taylorwilsdon/google_workspace_mcp` | Community MCP (2 k★, MIT, PyPI: `workspace-mcp`) covering Calendar, Tasks, Gmail, Drive, Docs, Sheets under one OAuth 2.1 server. Used directly by the agent. |
 
 ## **7.2 MCP Tools Catalog** {#7.2-mcp-tools-catalog}
 
@@ -276,39 +283,82 @@ All tools follow the standard MCP schema: name, description, inputSchema (JSON S
 
 | Tool ID | Description | Main Parameters | Return |
 | ----- | ----- | ----- | ----- |
-| **board\_list\_projects** | List of active projects with task count by status. | { active\_only?: boolean } | { projects: \[{ id, name, task\_counts }\] } |
-| **board\_get\_project** | Returns details and tasks of a project. | { project\_id: string } | { project, tasks: Task\[\] } |
-| **board\_get\_my\_tasks** | Tasks assigned to a user with optional filters. | { assignee, status\_filter?, due\_filter?: "today"|"week"|"overdue" } | { tasks: Task\[\] } |
+| **board\_list\_projects** | List of active projects with task count by status, completion %, and deadline. | { active\_only?: boolean } | { projects: \[{ id, name, status, responsible, deadline, task\_counts, completion\_pct }\] } |
+| **board\_get\_project** | Returns full project details, its epics, and tasks. | { project\_id: string, include\_subtasks?: boolean } | { project: Project, epics: Epic\[\], tasks: Task\[\] } |
+| **board\_create\_project** | Create a new project in the Projects tab. | { name, description?, goal?, responsible, deadline?, priority?, team?: string\[\] } | { project\_id } |
+| **board\_update\_project** | Update fields in an existing project. | { project\_id, fields: Partial\<Project\> } | { success, updated\_fields: string\[\] } |
+| **board\_list\_epics** | List epics for a project with progress info. | { project\_id: string, status\_filter?: string } | { epics: \[{ epic\_id, title, status, completion\_pct, total\_tasks }\] } |
+| **board\_get\_epic** | Returns epic details and all its tasks. | { epic\_id: string, include\_subtasks?: boolean } | { epic: Epic, tasks: Task\[\] } |
+| **board\_create\_epic** | Create a new epic under a project. | { title, project\_id, description?, responsible?, target\_date?, priority? } | { epic\_id } |
+| **board\_update\_epic** | Update fields in an existing epic. | { epic\_id, fields: Partial\<Epic\> } | { success, updated\_fields: string\[\] } |
+| **board\_get\_my\_tasks** | Tasks assigned to a user with optional filters. | { assignee, status\_filter?, due\_filter?: "today"\|"week"\|"overdue", include\_subtasks?: boolean } | { tasks: Task\[\] } |
+| **board\_get\_task** | Returns a single task by ID with full details including sub-tasks. | { task\_id: string, include\_subtasks?: boolean } | { task: Task, subtasks?: Task\[\] } |
+| **board\_search\_tasks** | Free-text search across task titles, tags, and descriptions. Enables IDE/coworker agents to find tasks by context (e.g., "sync engine") without needing to know IDs. | { query: string, project\_id?: string, status\_filter?: string, limit?: number } | { tasks: Task\[\], count: number } |
 | **board\_get\_overdue** | Tasks with a due date in the past and a status of \!= Done | { assignee\_filter?: string } | { tasks: Task\[\], count: number } |
-| **board\_create\_task** | Create a new task on the board and sync it with Google Tasks. | { title, project\_id, assignee?, due\_date?, priority?, scheduled\_date?, notion\_link? } | { task\_id, row\_id, gtask\_id } |
+| **board\_create\_task** | Create a new task on the board and sync it with Google Tasks. | { title, project\_id, epic\_id?, parent\_task\_id?, assignee?, due\_date?, priority?, scheduled\_date?, notion\_link? } | { task\_id, row\_id, gtask\_id } |
+| **board\_create\_follow\_up** | Creates one or more successor tasks linked to a completed or in-progress task. Used by IDE agents to spawn review, testing, or deployment tasks after finishing implementation. | { source\_task\_id: string, follow\_ups: \[{ title, assignee?, priority?, due\_date?, relationship: "review"\|"test"\|"deploy"\|"alternative"\|"continuation" }\] } | { created: \[{ task\_id, title, relationship }\] } |
 | **board\_update\_task** | Updates fields in an existing task. | { task\_id, fields: Partial\<Task\> } | { success, updated\_fields: string\[\] } |
 | **board\_complete\_task** | Mark task as Done and sync with Google Tasks. | { task\_id } | { success, completed\_at } |
+| **board\_get\_subtasks** | Get all sub-tasks for a given parent task. | { parent\_task\_id: string } | { subtasks: Task\[\], count: number } |
 | **board\_bulk\_reschedule** | Reschedule multiple tasks at once. | { task\_ids: string\[\], new\_scheduled\_date: date } | { updated\_count, errors: \[\] } |
+| **board\_parse\_and\_create\_task** | Tier 2 NLP endpoint for Quick Capture. Receives raw natural-language text, calls an LLM (Gemini via UrlFetchApp) to parse it into structured fields, then creates the task. Used when the local Tier 1 parser's confidence is below threshold. | { raw\_text: string, source?: string } | { task\_id, title, parsed\_fields: Partial\<Task\>, confidence: number } |
 
-### **7.2.2 Tools de Notion** {#7.2.2-tools-de-notion}
+### **7.2.2 External MCP — Notion** {#7.2.2-external-mcp-notion}
+
+**Server:** `@notionhq/notion-mcp-server` — official, Notion-maintained (makenotion org). Remote hosted version at `https://mcp.notion.com/mcp` is the recommended path (OAuth, no token management). Local npm package (`v2.2.1`) available as fallback.
+
+The agent uses Notion MCP tools directly for all read and comment operations. The Apps Script **Notion Poller (M3)** remains responsible for the write side: translating Notion comments into board tasks (project-specific logic that belongs in Apps Script, not in the agent).
+
+| Notion MCP Tool | Used for in Daily Protocol |
+| ----- | ----- |
+| `retrieve-a-comment` | Fetch new comments from monitored pages (replaces custom notion\_get\_pending\_reviews) |
+| `retrieve-a-page` | Get page metadata and last-edited timestamp for agent context |
+| `get-block-children` | Read page body for summary context (replaces custom notion\_get\_page\_summary) |
+| `post-search` | Search for pages/databases to identify active project documentation |
+| `query-data-source` | Query Notion databases when project docs are structured as databases |
+| `create-a-comment` | Post agent-generated notes back to Notion pages when needed |
+
+> **Setup requirement:** the Notion integration must be explicitly granted access to each page/database via Notion's integration settings. Workspace-wide access is not automatic.
+
+### **7.2.3 External MCP — Google Workspace (Calendar, Tasks, Gmail)** {#7.2.3-external-mcp-google-workspace}
+
+**Server:** `taylorwilsdon/google_workspace_mcp` — community-maintained (MIT, PyPI: `workspace-mcp`, 2 k★). Covers 12 Google Workspace services under a single OAuth 2.1 server. This replaces all custom calendar, tasks, and notification tools that would otherwise have been implemented in the Board MCP.
+
+> **Alternative:** `google/mcp` (Google's own umbrella repo, Apache 2.0, 3.5 k★) exposes a remote Workspace MCP at `https://workspace-developer.goog/mcp` but carries a "not an officially supported Google product" disclaimer and is primarily demonstration-oriented. Monitor for production readiness — if it matures, prefer it over the community option.
+
+**Google Tasks tools used:**
+
+| Tool | Used for in Daily Protocol |
+| ----- | ----- |
+| `list_tasks` | Fetch tasks completed since a timestamp (replaces custom gtasks\_get\_completions) |
+| `manage_task` | Mark a task complete in Google Tasks when the agent calls board\_complete\_task |
+| `list_task_lists` | Enumerate project task lists |
+
+**Google Calendar tools used:**
+
+| Tool | Used for in Daily Protocol |
+| ----- | ----- |
+| `list_events` | Get today's calendar events and free blocks (replaces custom calendar\_get\_today) |
+| `create_event` | Create a focus time block for a task (replaces custom calendar\_create\_timeblock) |
+| `list_events` (date range) | Fetch deadlines in the next N days (replaces custom calendar\_get\_deadlines) |
+
+**Gmail tools used:**
+
+| Tool | Used for in Daily Protocol |
+| ----- | ----- |
+| `search_emails` | Find emails requiring action that should become tasks |
+| `send_email` | Send the daily digest to the user (replaces custom notify\_send\_digest) |
+| `send_email` | Send a direct message to a team member (replaces custom notify\_send\_dm) |
+
+> **Note on Google Chat standup posts:** `taylorwilsdon/google_workspace_mcp` does not currently cover Google Chat webhooks. The `notify_post_standup` call remains in the Board MCP as a thin wrapper around the Google Chat Incoming Webhook URL stored in PropertiesService.
+
+### **7.2.4 Board MCP — Standup Output** {#7.2.4-board-mcp-standup}
+
+This is the only notification tool that remains in the custom Board MCP, because Google Chat is not covered by the external Workspace MCP.
 
 | Tool ID | Description | Main Parameters | Return |
 | ----- | ----- | ----- | ----- |
-| **notion\_get\_pending\_reviews** | Notion comment review tasks not completed. | { since?: timestamp } | { tasks: ReviewTask\[\], count: number } |
-| **notion\_get\_recent\_activity** | New comments and quotes on monitored pages | { since: timestamp } | { comments: Comment\[\], citations: Citation\[\] } |
-| **notion\_get\_page\_summary** | Summary of a Notion page for agent context | { page\_id: string } | { title, last\_edited, summary\_text, comment\_count } |
-
-### **7.2.3 Calendar Tools and Time Context** {#7.2.3-calendar-tools-and-time-context}
-
-| Tool ID | Description | Main Parameters | Return |
-| ----- | ----- | ----- | ----- |
-| **calendar\_get\_today** | User's daily events on Google Calendar | { user\_email: string } | { events: CalEvent\[\], has\_free\_blocks: boolean } |
-| **calendar\_get\_deadlines** | Tasks with deadlines in the next N days. | { days: number, assignee?: string } | { deadlines: \[{ task, due\_date, days\_until }\] } |
-| **gtasks\_get\_completions** | Tasks completed since a timestamp (for yesterday's daily) | { since: timestamp, assignee?: string } | { completed\_tasks: Task\[\], count: number } |
-| **calendar\_create\_timeblock** | Create a time block in the calendar to work on a task. | { task\_id, start\_time, duration\_min } | { event\_id, start\_time, calendar\_link } |
-
-### **7.2.4 Notification and Output Tools** {#7.2.4-notification-and-output-tools}
-
-| Tool ID | Description | Main Parameters | Return |
-| ----- | ----- | ----- | ----- |
-| **notify\_post\_standup** | Post a formatted standup message on Google Chat. | { channel\_webhook: string, briefing: DailyBriefing } | { success, message\_url? } |
-| **notify\_send\_digest** | Sends daily digest to the user via email. | { to: string, briefing: DailyBriefing } | { success } |
-| **notify\_send\_dm** | Send a direct message via Gmail to a team member. | { to: string, subject: string, body: string } | { success, thread\_id } |
+| **notify\_post\_standup** | Post a formatted standup message on Google Chat via Incoming Webhook. | { channel\_webhook\_key: string, briefing: DailyBriefing } | { success, message\_url? } |
 
 ## **7.3 Daily Agent Protocol** {#7.3-daily-agent-protocol}
 
@@ -318,29 +368,31 @@ The Daily Agent operates at two fixed times per day. It calls MCP tools sequenti
 
 Objective: to generate clarity about the day, identify risks, and post an opening stand-up routine.
 
-| \# | Tool / Action | Objective and Output |
-| :---: | ----- | ----- |
-| **1** | gtasks\_get\_completions(since=yesterday\_9am) | List what was actually completed yesterday → "completed" section of the standup |
-| **2** | board\_get\_my\_tasks(due\_filter="today") | Tasks scheduled for today → based on the "focus\_today" section |
-| **3** | board\_get\_overdue(assignee=user) | Overdue tasks → flag them in "blockers"; identify if the same task has been overdue for the 2nd or more day. |
-| **4** | calendar\_get\_today(user\_email) | Meetings and block parties that reduce availability → adjust the suggested top 3 tasks based on the available time. |
-| **5** | calendar\_get\_deadlines(days=3) | Deadlines approaching → raise the priority of the corresponding tasks. |
-| **6** | notion\_get\_pending\_reviews() | Comments on Notion awaiting review → include on the day if critical |
-| **7** | **\[Agent Synthesis\]** | Gerar DailyBriefing: accomplished / focus\_today (top 3\) / overdue / notion\_reviews / blockers / narrative |
-| **8** | board\_bulk\_reschedule() \[condicional\] | If there are overdue tasks without a Point of Sale (P0), reschedule for today or tomorrow based on availability analysis. |
-| **9** | notify\_post\_standup() \+ notify\_send\_digest() | Post the briefing on Google Chat (structured format) and send a digest to the user via email. |
+| \# | Tool / Action | MCP Server | Objective and Output |
+| :---: | ----- | ----- | ----- |
+| **1** | `list_tasks(completed=true, since=yesterday_9am)` | Google Workspace MCP | List what was actually completed yesterday → "accomplished" section of the standup. |
+| **2** | `board_get_my_tasks(due_filter="today")` | Board MCP (custom) | Tasks scheduled for today → basis for the "focus\_today" section. |
+| **3** | `board_get_overdue(assignee=user)` | Board MCP (custom) | Overdue tasks → flag in "blockers"; identify tasks overdue 2+ days in a row. |
+| **4** | `list_events(date=today, user_email)` | Google Workspace MCP | Meetings and time blocks that reduce availability → adjust suggested top 3 tasks based on available hours. |
+| **5** | `list_events(date_range=next_3_days)` | Google Workspace MCP | Deadlines approaching → raise the priority of corresponding tasks on the board. |
+| **6** | `retrieve-a-comment(block_id)` per monitored page | Notion MCP | New comments on Notion pages awaiting review → include in the day if critical. |
+| **7** | **\[Agent Synthesis\]** | — | Generate DailyBriefing: accomplished / focus\_today (top 3) / overdue / notion\_reviews / blockers / narrative. |
+| **8** | `board_bulk_reschedule()` \[conditional\] | Board MCP (custom) | If overdue tasks exist (non-P0), reschedule for today or tomorrow based on availability from step 4. |
+| **9** | `notify_post_standup()` + `send_email(digest)` | Board MCP (standup) + Google Workspace MCP (email) | Post briefing on Google Chat; send digest email to the user. |
 
 ### **7.3.2 EOD Daily — 18:00** {#7.3.2-eod-daily-—-18:00}
 
 Objective: to track progress, calculate completion rate, plan carry-overs, and generate tomorrow's preview.
 
-6. board\_get\_my\_tasks(due\_filter="today") — check what should have been done  
-7. gtasks\_get\_completions(since=today\_9am) — which was effectively completed today  
-8. board\_get\_overdue() — carry-overs and tasks that came from previous days.  
-9. \[Agent Synthesis\] — calculate completion rate; detect patterns (e.g., tasks of type X are always delayed)  
-10. board\_bulk\_reschedule(uncompleted\_today, tomorrow) — automatically reschedule incomplete tasks.  
-11. board\_get\_my\_tasks(due\_filter="week") — generate a preview of the next 2 business days  
-12. notify\_post\_standup(eod\_summary) \+ notify\_send\_digest(tomorrow\_preview)
+| \# | Tool / Action | MCP Server | Objective and Output |
+| :---: | ----- | ----- | ----- |
+| **1** | `board_get_my_tasks(due_filter="today")` | Board MCP (custom) | Check what should have been done today. |
+| **2** | `list_tasks(completed=true, since=today_9am)` | Google Workspace MCP | What was effectively completed today (source of truth for completion). |
+| **3** | `board_get_overdue()` | Board MCP (custom) | Carry-overs and tasks from previous days still unresolved. |
+| **4** | **\[Agent Synthesis\]** | — | Calculate completion rate; detect patterns (e.g., tasks of type X always delayed). |
+| **5** | `board_bulk_reschedule(uncompleted_today, tomorrow)` | Board MCP (custom) | Automatically reschedule incomplete tasks (max 10, non-P0 only). |
+| **6** | `board_get_my_tasks(due_filter="week")` | Board MCP (custom) | Generate preview of the next 2 business days. |
+| **7** | `notify_post_standup(eod_summary)` + `send_email(tomorrow_preview)` | Board MCP (standup) + Google Workspace MCP (email) | Post EOD summary to Google Chat; send tomorrow's preview by email. |
 
 ### **7.3.3 Schema DailyBriefing** {#7.3.3-schema-dailybriefing}
 
@@ -370,16 +422,15 @@ narrative: string; // paragraph in Brazilian Portuguese generated by the agent
 
 }
 
-## **7.4 Connection Points with External MCPs** {#7.4-connection-points-with-external-mcps}
+## **7.4 MCP Server Registry** {#7.4-mcp-server-registry}
 
-In addition to the native MCP Server, the agent connects to external MCPs already available in the ecosystem for context and additional actions. The table below maps the three available MCPs and their role in the daily protocol.
+Summary of all MCP servers the Daily Agent connects to, with authoritative source references.
 
-| External MCP | Endpoint / Status | Tools Relevant to Daily | Non-Protocol Use |
-| ----- | ----- | ----- | ----- |
-| **Notion MCP** | mcp.notion.com/mcp ✅ Available | notion\_search notion\_retrieve\_page notion\_query\_database notion\_get\_comments | Deep search in Notion databases; retrieval of page content for agent context; fallback if the AS Notion Poller is delayed. |
-| **Gmail MCP** | gmail.mcp.claude.com/mcp ✅ Available | gmail\_search\_messages gmail\_read\_thread | Identify emails that require action and should generate tasks; detect approvals responded to by email that should update the status on the board. |
-| **Google Calendar MCP** | gcal.mcp.claude.com/mcp ✅ Available | list\_events create\_event check\_availability | Native Calendar reading for morning daily tasks; creation of time blocks for the top 3 tasks; checking actual availability before rescheduling tasks. |
-| **GSheets Work OS MCP (this document)** | script.google.com/macros/.../exec 🔧 To be implemented | Complete catalog §7.2 (board, notion, calendar, notification tools) | Reading and writing to the board; creating and completing tasks; bulk rescheduling; forced syncing with Google Tasks. |
+| MCP Server | Source / Endpoint | Maintainer | Status | Scope in this project |
+| ----- | ----- | ----- | ----- | ----- |
+| **Notion MCP** | Remote: `https://mcp.notion.com/mcp` (OAuth) · Local: `npx @notionhq/notion-mcp-server` · Repo: `github.com/makenotion/notion-mcp-server` | Notion (official) | ✅ Production — remote is actively maintained; local package v2.2.1 in maintenance mode | Read Notion pages, comments, and databases; post comments. Does NOT create board tasks — that's the Notion Poller's job. |
+| **Google Workspace MCP** | Local: `pip install workspace-mcp` · Repo: `github.com/taylorwilsdon/google_workspace_mcp` · Alt: `https://workspace-developer.goog/mcp` (Google, unofficial) | Community (Taylor Wilsdon, 2 k★) | ✅ Stable, actively maintained. Monitor `google/mcp` for official replacement. | Calendar (events, time blocks), Tasks (list, complete), Gmail (send digest, search emails). Single OAuth 2.1 setup for all Google services. |
+| **Board MCP (custom)** | `https://script.google.com/macros/s/{DEPLOYMENT_ID}/exec` | This project (Apps Script) | 🔧 To be implemented (v1.5) | All board operations: projects, epics, tasks, sub-tasks, bulk reschedule, standup post to Google Chat. |
 
 ## **7.5 System Prompt do Daily Agent (Template)** {#7.5-system-prompt-do-daily-agent-(template)}
 
@@ -421,6 +472,78 @@ FORMATO DO STANDUP (notify\_post\_standup):
 
 Narrative: brief, in Brazilian Portuguese, direct. Maximum 2 sentences.
 
+## **7.6 Multi-Agent Access Model** {#7.6-multi-agent-access-model}
+
+The Board MCP is designed to be consumed not only by the Daily Agent but by any MCP-compatible agent — IDE coding agents (Claude Code, Cursor, Windsurf), coworker agents, CI/CD bots, or custom automation scripts. To support this safely, the system implements agent identity and role-based permissions at the MCP layer.
+
+### **7.6.1 Agent Authentication** {#7.6.1-agent-authentication}
+
+Each agent receives a unique `agent_id` and its own HMAC secret, both stored in PropertiesService:
+
+| Property Key | Example | Notes |
+| ----- | ----- | ----- |
+| `agent_secret_daily` | `hmac-sha256-secret-daily-...` | Daily Agent (morning + EOD rituals) |
+| `agent_secret_ide_alice` | `hmac-sha256-secret-ide-alice-...` | Alice's IDE agent (Claude Code / Cursor) |
+| `agent_secret_ci` | `hmac-sha256-secret-ci-...` | CI/CD pipeline bot |
+
+Every MCP request must include `agent_id` in the JSON-RPC params. The endpoint validates the HMAC using the agent-specific secret. This allows:
+- **Per-agent audit trail** — every change recorded in Changelog includes the agent\_id.
+- **Per-agent revocation** — disable one agent without affecting others.
+- **Per-agent rate limiting** — prevent a runaway agent from exhausting the Apps Script quota.
+
+### **7.6.2 Agent Roles and Permission Scopes** {#7.6.2-agent-roles}
+
+Permissions are enforced server-side by the Apps Script Tool Router, not by prompt instructions alone. Each role defines which MCP tools are allowed:
+
+| Role | Intended Consumer | Allowed Tools | Denied Tools |
+| ----- | ----- | ----- | ----- |
+| **daily** | Daily Agent (scheduled morning + EOD) | `board_get_my_tasks`, `board_get_overdue`, `board_get_task`, `board_search_tasks`, `board_complete_task`, `board_update_task` (status, scheduled\_date, priority only), `board_bulk_reschedule`, `board_get_subtasks`, `board_get_project`, `board_list_projects`, `board_list_epics`, `board_get_epic`, `notify_post_standup` | `board_create_project`, `board_update_project`, `board_create_epic`, `board_update_epic`, `board_create_task` (requires `ide` or `admin`), `board_create_follow_up` |
+| **ide** | IDE coding agents (Claude Code, Cursor, Windsurf, etc.) | `board_get_task`, `board_search_tasks`, `board_get_my_tasks`, `board_get_project`, `board_get_epic`, `board_get_subtasks`, `board_complete_task`, `board_update_task`, `board_create_task`, `board_create_follow_up` | `board_create_project`, `board_create_epic`, `board_update_project`, `board_update_epic`, `board_bulk_reschedule`, `notify_post_standup` |
+| **admin** | Human user (via direct MCP client or global shortcut) | All tools | None |
+
+> **Role assignment:** the `agent_id → role` mapping is stored in PropertiesService as `agent_role_{agent_id}`. Default role for unrecognized agent\_ids: **denied** (fail-closed).
+
+### **7.6.3 IDE / Coworker Agent Workflow Example** {#7.6.3-ide-agent-workflow}
+
+A typical flow for a Claude Code agent working on a coding task:
+
+```
+1. Agent starts a coding session and queries the board:
+   → board_search_tasks(query="sync engine", status_filter="In Progress")
+   ← { tasks: [{ task_id: "TSK-0042", title: "Implement sync engine", ... }] }
+
+2. Agent works on the implementation, then marks the task done:
+   → board_complete_task(task_id="TSK-0042")
+   ← { success: true, completed_at: "2025-04-10T16:30:00" }
+
+3. Agent creates follow-up tasks for review and testing:
+   → board_create_follow_up(
+       source_task_id="TSK-0042",
+       follow_ups=[
+         { title: "Code review: sync engine", relationship: "review", assignee: "alice@co.com", priority: "P1" },
+         { title: "Write integration tests: sync engine", relationship: "test", priority: "P2" },
+         { title: "Evaluate alternative: Cloud Functions vs Apps Script triggers", relationship: "alternative", priority: "P2" }
+       ]
+     )
+   ← { created: [
+       { task_id: "TSK-0043", title: "Code review: sync engine", relationship: "review" },
+       { task_id: "TSK-0044", title: "Write integration tests: sync engine", relationship: "test" },
+       { task_id: "TSK-0045", title: "Evaluate alternative: ...", relationship: "alternative" }
+     ] }
+```
+
+All three actions are logged in the Changelog with the IDE agent's `agent_id`, making it clear that the completion and follow-ups were agent-driven, not human-driven.
+
+### **7.6.4 Changelog Agent Audit Fields** {#7.6.4-changelog-agent-audit}
+
+The Changelog tab (M1-09) is extended with agent-specific columns:
+
+| Field | Type | Example | Notes |
+| ----- | ----- | ----- | ----- |
+| **source** | enum | agent | `human` (Sheets UI edit) \| `agent` (MCP call) \| `system` (Apps Script trigger) |
+| **agent\_id** | string | ide\_alice | Null when source = human. Identifies which agent made the change. |
+| **agent\_role** | string | ide | The role under which the agent was operating. |
+
 # **8\. Non-Functional Requirements** {#8.-non-functional-requirements}
 
 ---
@@ -441,24 +564,118 @@ Narrative: brief, in Brazilian Portuguese, direct. Maximum 2 sentences.
 
 ## ---
 
-**9.1 Task Scheme (Board Line)** {#9.1-task-scheme-(board-line)}
+**9.1 Project Scheme ("Projects" Tab)** {#9.1-project-scheme}
+
+Each project is a row in a dedicated "Projects" tab in the same Google Sheets workbook. All tasks and epics reference a project via `project_id`.
+
+| Field | Type | Example | Notes |
+| ----- | ----- | ----- | ----- |
+| **project\_id** | string | PRJ-bigquery | UUID generated by Apps Script (PRJ- prefix); immutable. |
+| **name** | string | BigQuery Migration | Required; max 120 characters; unique. |
+| **description** | string | Migrate legacy warehouse to BigQuery | Free-text summary of the project scope; max 500 characters. |
+| **goal** | string | Reduce query cost by 40% and improve latency to < 2s | Measurable objective or OKR the project targets. |
+| **responsible** | email | owner@company.com | Project owner / lead; valid Google Workspace email. |
+| **team** | string\[\] | alice@co.com,bob@co.com | CSV of collaborator emails; used for notifications and Sheets range protection (M1-10). |
+| **status** | enum | Active | Not Started \| Active \| On Hold \| Completed \| Cancelled |
+| **priority** | enum | P1 | P0 (critical) \| P1 (high) \| P2 (normal) \| P3 (low) |
+| **start\_date** | date | 2025-04-01 | Planned kick-off date; ISO 8601. |
+| **deadline** | date | 2025-06-30 | Target completion date; ISO 8601. Triggers calendar event and overdue alerts. |
+| **budget\_h** | number | 320 | Total budgeted effort in hours; compared against sum of task effort\_h for tracking. |
+| **category** | string | Engineering | Free-text grouping (e.g., Engineering, Marketing, Operations); used for dashboard filters. |
+| **notion\_space\_url** | url | notion.so/space/... | Link to the project's Notion workspace or top-level page for documentation. |
+| **notes** | string | Depends on infra team approval | Free-text field for additional context, risks, or dependencies. |
+| **created\_at** | datetime | 2025-04-01T09:00:00 | Auto-populated; immutable. |
+| **updated\_at** | datetime | 2025-04-15T14:30:00 | Auto-updated on any field change via onEdit trigger. |
+
+**Derived / computed columns (shown in the Projects tab but not editable):**
+
+| Field | Source | Notes |
+| ----- | ----- | ----- |
+| **total\_tasks** | COUNT of tasks where project\_id matches | Auto-calculated via COUNTIF formula or Apps Script. |
+| **completed\_tasks** | COUNT of tasks where project\_id matches AND status = Done | Used to compute completion percentage. |
+| **completion\_%** | completed\_tasks / total\_tasks | Displayed as progress bar via conditional formatting. |
+| **total\_effort\_h** | SUM of effort\_h for all tasks in the project | Compared against budget\_h for burn tracking. |
+| **overdue\_tasks** | COUNT of tasks where due\_date < today AND status ≠ Done | Highlighted in red when > 0. |
+
+---
+
+**9.2 Epic Scheme ("Epics" Tab)** {#9.2-epic-scheme}
+
+An Epic is the middle layer between Projects and Tasks. It groups related tasks into a coherent deliverable or feature within a project. Each epic belongs to exactly one project, and each task may optionally belong to one epic.
+
+| Field | Type | Example | Notes |
+| ----- | ----- | ----- | ----- |
+| **epic\_id** | string | EPC-0012 | UUID generated by Apps Script (EPC- prefix); immutable. |
+| **title** | string | Schema Design & Validation | Required; max 200 characters. |
+| **description** | string | Design all BQ tables and validate with stakeholders | Summary of the epic's scope and deliverables; max 500 characters. |
+| **project\_id** | string | PRJ-bigquery | FK to the Projects table; required. |
+| **responsible** | email | alice@company.com | Epic owner; defaults to the project responsible if not set. |
+| **status** | enum | In Progress | Not Started \| In Progress \| Done \| Cancelled |
+| **priority** | enum | P1 | P0 (critical) \| P1 (high) \| P2 (normal) \| P3 (low) |
+| **start\_date** | date | 2025-04-05 | Planned start date; ISO 8601. |
+| **target\_date** | date | 2025-05-15 | Target completion date for the epic; triggers alerts when approaching. |
+| **acceptance\_criteria** | string | All 12 tables created, validated by data team, and documented in Notion | Definition of done for the epic; free-text. |
+| **tags** | string\[\] | backend,schema | CSV; no spaces; lowercase. |
+| **notion\_link** | url | notion.so/page/... | Link to the epic's Notion page for detailed specs or documentation. |
+| **sort\_order** | number | 1 | Manual ordering within a project; lower numbers appear first. |
+| **created\_at** | datetime | 2025-04-05T10:00:00 | Auto-populated; immutable. |
+| **updated\_at** | datetime | 2025-04-20T11:15:00 | Auto-updated on any field change via onEdit trigger. |
+
+**Derived / computed columns:**
+
+| Field | Source | Notes |
+| ----- | ----- | ----- |
+| **total\_tasks** | COUNT of tasks where epic\_id matches | Auto-calculated. |
+| **completed\_tasks** | COUNT of tasks where epic\_id matches AND status = Done | Used to compute epic progress. |
+| **completion\_%** | completed\_tasks / total\_tasks | Displayed as progress bar via conditional formatting. |
+| **total\_effort\_h** | SUM of effort\_h for all tasks in the epic | Useful for sprint/capacity planning. |
+
+---
+
+**9.3 Task Scheme ("Board" Tab)** {#9.3-task-scheme-(board-line)}
+
+All tasks — including sub-tasks — reside in the same "Board" tab. A task becomes a sub-task when its `parent_task_id` is set. Sub-tasks inherit the project and epic from the parent unless explicitly overridden.
 
 | Field | Type | Example | Notes |
 | ----- | ----- | ----- | ----- |
 | **task\_id** | string | TSK-0042 | UUID generated by Apps Script; immutable. |
-| **title** | string | Review schema BQ | Required; max 200 characters |
-| **project\_id** | string | PRJ-bigquery | FK for both Projects |
-| **status** | enum | In Progress | Inbox | To Do | In Progress | Review | Done | Cancelled | Blocked |
+| **title** | string | Review schema BQ | Required; max 200 characters. |
+| **project\_id** | string | PRJ-bigquery | FK to the Projects table; required. Inherited from parent if sub-task. |
+| **epic\_id** | string | EPC-0012 | FK to the Epics table; optional. Groups tasks under an epic within a project. |
+| **parent\_task\_id** | string | TSK-0040 | FK to another task in this same table; null for top-level tasks. When set, the task is a sub-task of the referenced task. Max nesting depth: 1 (sub-tasks cannot have their own sub-tasks). |
+| **status** | enum | In Progress | Inbox \| To Do \| In Progress \| Review \| Done \| Cancelled \| Blocked |
 | **assignee** | email | user@email.com | Valid Google email address for notifications. |
-| **priority** | enum | P1 | P0 (critical) | P1 (high) | P2 (normal) | P3 (low) |
+| **priority** | enum | P1 | P0 (critical) \| P1 (high) \| P2 (normal) \| P3 (low) |
 | **due\_date** | date | 2025-04-10 | ISO 8601; triggers sync with Google Tasks and Calendar. |
 | **scheduled\_date** | date | 2025-04-07 | "When am I going to work on this?" — different from the due date. |
 | **start\_date** | date | 2025-04-05 | Used in Gantt/Timeline view. |
 | **effort\_h** | number | 2.5 | Estimate in hours; used in velocity tracking. |
-| **tags** | string\[\] | bigquery,review | CSV; no spaces; lowercase |
-| **notion\_link** | url | notion.so/page/... | Populated by Notion Poller; hyperlink in Sheets cell |
-| **gtask\_id** | string | MDEwOTEx... | ID da Google Task; coluna hidden no Sheets |
+| **tags** | string\[\] | bigquery,review | CSV; no spaces; lowercase. |
+| **notion\_link** | url | notion.so/page/... | Populated by Notion Poller; hyperlink in Sheets cell. |
+| **follow\_up\_from** | string | TSK-0040 | FK to the predecessor task that originated this follow-up; null if not a follow-up. Set by `board_create_follow_up`. |
+| **follow\_up\_type** | enum | review | review \| test \| deploy \| alternative \| continuation; null if not a follow-up. Describes the relationship to the predecessor. |
+| **gtask\_id** | string | MDEwOTEx... | ID da Google Task; hidden column in Sheets. |
+| **created\_by** | string | ide\_alice | `agent_id` of the agent that created this task, or "human" if created via Sheets UI. Used for audit. |
 | **created\_at** | datetime | 2025-04-07T08:30:00 | Auto-populated in the onEdit creation event; immutable. |
+
+**Sub-task behavior rules:**
+
+* A sub-task is any row where `parent_task_id` is not empty.
+* Sub-tasks are visually indented in the Board tab using conditional formatting (e.g., title prefixed with "↳" or left-padded).
+* When all sub-tasks of a parent are marked "Done", the parent task's status is **not** automatically changed — the user must explicitly mark it as Done (prevents premature closure).
+* Filtering by a parent task shows all its sub-tasks; filtering by an epic shows all tasks (including sub-tasks) under that epic.
+* Max nesting depth is 1: a sub-task (`parent_task_id` is set) cannot itself be a parent. Apps Script validates this on creation.
+* Sub-tasks sync independently to Google Tasks under the same project list as the parent.
+
+**Relationship summary:**
+
+```
+Project (1) ──── (N) Epic (1) ──── (N) Task (1) ──── (N) Sub-task
+   │                                      │
+   └──────────── (N) Task (direct) ───────┘
+```
+
+A task can belong directly to a project without an epic (`epic_id` = null). Sub-tasks always reference a parent task via `parent_task_id` and reside in the same Board tab.
 
 # **10\. Security and Access Control** {#10.-security-and-access-control}
 
